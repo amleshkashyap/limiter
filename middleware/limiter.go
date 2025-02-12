@@ -5,6 +5,7 @@ import (
 	"context"
 	"time"
 	"strconv"
+	"github.com/google/uuid"
 	"encoding/json"
 	"github.com/gin-gonic/gin"
 	"github.com/amleshkashyap/limiter/rules"
@@ -19,11 +20,16 @@ type RateLimiter interface {
 }
 
 type FixedWindowCounter struct {
-	windowDuration time.Duration
+	windowDuration int64
 	windowStart int64
 }
 
-var fwcLimiter RateLimiter;
+type SlidingWindowLog struct {
+	windowDuration int64
+}
+
+var fwcLimiter RateLimiter
+var swlLimiter RateLimiter
 
 func InitRateLimiters(storedRules rules.StoredRule) {
 	v, err := json.Marshal(storedRules)
@@ -34,7 +40,10 @@ func InitRateLimiters(storedRules rules.StoredRule) {
 	if err != nil {
 		fmt.Println("Coudn't set rules to redis", err)
 	}
-	fwcLimiter = FixedWindowCounter{windowDuration: time.Duration(60000000), windowStart: time.Now().Unix()}
+	key := fmt.Sprintf("%s:%s:%s", storedRules.Domain, storedRules.Key, storedRules.Value)
+	RedisClient.ZAdd(context.Background(), key, redis.Z{Score: float64(2147483647), Member: "dummy"}).Result()
+	fwcLimiter = FixedWindowCounter{windowDuration: 60, windowStart: time.Now().Unix()}
+	swlLimiter = SlidingWindowLog{windowDuration: 10}
 }
 
 // Blanket Error Handling Policy
@@ -64,7 +73,8 @@ func RateLimiterMiddleware(ginCtx *gin.Context) (RateLimiter, rules.StoredRule) 
 
 	for key, val := range query_params {
 		if key == storedRules.Key && val[0] == storedRules.Value {
-			return fwcLimiter, storedRules
+			// return fwcLimiter, storedRules
+			return swlLimiter, storedRules
 		}
 	}
 
@@ -80,7 +90,7 @@ func (fwc FixedWindowCounter) Handle(ginCtx *gin.Context, rule rules.StoredRule)
 
 	if err == redis.Nil {
 		fmt.Println("Couldn't find in redis, setting")
-                err := RedisClient.Set(context.Background(), key, 1, time.Duration(60000000000)).Err()
+                err := RedisClient.Set(context.Background(), key, 1, 60).Err()
                 if err != nil {
                         fmt.Println("Error while setting", err)
                 }
@@ -106,4 +116,37 @@ func (fwc FixedWindowCounter) getKey(ginCtx *gin.Context) {
 }
 
 func (fwc FixedWindowCounter) RateLimitExceeded (ginCtx *gin.Context) {
+}
+
+func (swl SlidingWindowLog) Handle(ginCtx *gin.Context, rule rules.StoredRule) {
+	key := fmt.Sprintf("%s:%s:%s", rule.Domain, rule.Key, rule.Value)
+	fmt.Println("key: ", key)
+
+	now := time.Now().Unix()
+	windowStart := now - swl.windowDuration
+	beforeWindowStart := windowStart - (5 * swl.windowDuration)
+
+	res, err := RedisClient.ZRangeByScore(context.Background(), key, &redis.ZRangeBy{Min: fmt.Sprintf("%d", beforeWindowStart), Max: fmt.Sprintf("%d", windowStart)}).Result()
+	if err != nil {
+		fmt.Println("Couldn't get score")
+	}
+	if len(res) > 0 {
+		RedisClient.ZPopMin(context.Background(), key, int64(len(res))).Result()
+	}
+	count, err := RedisClient.ZCard(context.Background(), key).Result()
+	if count > int64(rule.MaxRequests) {
+		ginCtx.JSON(429, gin.H{"msg": "Too Many Request"})
+                ginCtx.Abort()
+                return
+	}
+	RedisClient.ZAdd(context.Background(), key, redis.Z{Score: float64(now), Member: uuid.New().String()}).Result()
+}
+
+func (swl SlidingWindowLog) getRules() {
+}
+
+func (swl SlidingWindowLog) getKey(ginCtx *gin.Context) {
+}
+
+func (swl SlidingWindowLog) RateLimitExceeded(ginCtx *gin.Context) {
 }
