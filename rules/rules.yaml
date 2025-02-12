@@ -1,0 +1,6 @@
+domain: /resource
+method: GET
+key: key
+value: value
+maxRequests: 10
+unit: minutes
